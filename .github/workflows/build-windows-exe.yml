@@ -1,0 +1,35 @@
+name: Build Windows exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x64"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: pyinstaller "客服总结.spec" --noconfirm --clean
+
+      - name: Upload exe folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: 客服总结-windows-exe
+          path: dist/客服总结
