@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+# 含客户聊天摘要，勿提交仓库
+data/learning_cases.jsonl
+data/app_settings.json
+build/
+dist/
+.venv_build/

@@ -1,0 +1,8 @@
+# 固定端口，避免与其它 Streamlit 项目（如默认 8501）串页
+[server]
+port = 8720
+address = "127.0.0.1"
+headless = true
+
+[browser]
+gatherUsageStats = false
