@@ -32,8 +32,10 @@ def _app_dir() -> Path:
 
 APP_DIR = _app_dir()
 DATA_DIR = APP_DIR / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
 LEARNING_PATH = DATA_DIR / "learning_cases.jsonl"
 SETTINGS_PATH = DATA_DIR / "app_settings.json"
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 # MiniMax 文本接口（与 A-SIR 项目文档一致）：https://api.minimaxi.com/v1/text/chatcompletion_v2
 MINIMAX_NATIVE_URL = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
@@ -486,6 +488,18 @@ def _row_similarity(a: pd.Series | dict, b: pd.Series | dict) -> float:
     return SequenceMatcher(None, sig_a, sig_b).ratio()
 
 
+def _same_order_should_replace(old: pd.Series | dict, new_row: dict[str, str]) -> bool:
+    old_size = str(old.get("尺寸数量", "") or "").strip()
+    new_size = str(new_row.get("尺寸数量", "") or "").strip()
+    old_img = str(old.get("图片", "") or "").strip()
+    new_img = str(new_row.get("图片", "") or "").strip()
+    if old_size and new_size and old_size != new_size:
+        return False
+    if old_img and new_img and old_img != new_img:
+        return False
+    return True
+
+
 def merge_row_into_table(df: pd.DataFrame, row: dict[str, str]) -> pd.DataFrame:
     """同订单号覆盖；明显同一条记录覆盖；差异大则新增一行。"""
     cur = df.copy() if isinstance(df, pd.DataFrame) else default_table_df()
@@ -504,10 +518,15 @@ def merge_row_into_table(df: pd.DataFrame, row: dict[str, str]) -> pd.DataFrame:
 
     order_no = _normalize_id(new_row.get("订单号"))
     if order_no:
+        saw_same_order = False
         for idx, old in cur.iterrows():
             if _normalize_id(old.get("订单号")) == order_no:
-                cur.loc[idx, COLUMNS] = [new_row[c] for c in COLUMNS]
-                return cur
+                saw_same_order = True
+                if _same_order_should_replace(old, new_row):
+                    cur.loc[idx, COLUMNS] = [new_row[c] for c in COLUMNS]
+                    return cur
+        if saw_same_order:
+            return pd.concat([cur, pd.DataFrame([new_row], columns=COLUMNS)], ignore_index=True)
 
     best_idx: int | None = None
     best_score = 0.0
@@ -521,6 +540,77 @@ def merge_row_into_table(df: pd.DataFrame, row: dict[str, str]) -> pd.DataFrame:
         return cur
 
     return pd.concat([cur, pd.DataFrame([new_row], columns=COLUMNS)], ignore_index=True)
+
+
+def extract_size_quantity_items(chat: str) -> list[str]:
+    """从对话中拆出多个尺寸/数量，用于待确认框。"""
+    if not chat:
+        return []
+    lines = [x.strip() for x in chat.splitlines()]
+    items: list[str] = []
+    seen: set[str] = set()
+    size_re = re.compile(
+        r"(\d+(?:\.\d+)?)\s*[×xX*]\s*(\d+(?:\.\d+)?)\s*(cm|CM|厘米|mm|MM|毫米)?"
+    )
+    qty_re = re.compile(r"(?:[xX×]\s*(\d+)\b|(\d+)\s*(?:张|个|份|套|盒|包)\b)")
+    for i, line in enumerate(lines):
+        for sm in size_re.finditer(line):
+            unit = sm.group(3) or "cm"
+            size = f"{sm.group(1)}×{sm.group(2)}{unit.lower()}"
+            nearby = " ".join(lines[max(0, i - 1): min(len(lines), i + 2)])
+            qm = qty_re.search(nearby)
+            qty = ""
+            if qm:
+                qty_num = qm.group(1) or qm.group(2)
+                qty = f" x{qty_num}"
+            item = f"{size}{qty}".strip()
+            if item not in seen:
+                seen.add(item)
+                items.append(item)
+    return items
+
+
+def split_row_into_draft_rows(row: dict[str, str], chat: str) -> list[dict[str, str]]:
+    items = extract_size_quantity_items(chat)
+    if not items:
+        return [{col: str(row.get(col, "") or "") for col in COLUMNS}]
+    rows = []
+    for item in items:
+        r = {col: str(row.get(col, "") or "") for col in COLUMNS}
+        r["尺寸数量"] = item
+        rows.append(r)
+    return rows
+
+
+def save_uploaded_images(files: list) -> list[str]:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for i, f in enumerate(files, 1):
+        name = Path(f.name).name
+        safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]+", "_", name).strip("._")
+        if not safe_name:
+            safe_name = f"image_{i}.png"
+        target = UPLOAD_DIR / f"{stamp}_{i:02d}_{safe_name}"
+        with target.open("wb") as out:
+            out.write(f.getbuffer())
+        saved.append(str(target))
+    return saved
+
+
+def assign_images_to_draft(draft: pd.DataFrame, image_paths: list[str]) -> pd.DataFrame:
+    out = draft.copy()
+    for col in COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    out = out.reindex(columns=COLUMNS, fill_value="")
+    if len(out) == 0:
+        out = pd.DataFrame([empty_row() for _ in image_paths], columns=COLUMNS)
+    for i, path in enumerate(image_paths):
+        if i >= len(out):
+            out = pd.concat([out, pd.DataFrame([empty_row()], columns=COLUMNS)], ignore_index=True)
+        out.loc[i, "图片"] = path
+    return out
 
 
 def merge_ai_into_row(base: dict[str, str], data: dict) -> dict[str, str]:
@@ -775,9 +865,33 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = BytesIO()
     # 表头第一行与模板一致
     export_df = df.copy()
+    image_refs: list[tuple[int, Path]] = []
+    if "图片" in export_df.columns:
+        for idx, value in export_df["图片"].items():
+            p = Path(str(value or "").strip())
+            if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES:
+                image_refs.append((int(idx) + 2, p))
+                export_df.at[idx, "图片"] = p.name
     # 列名里 J 列为空字符串，Excel 会显示为空表头
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         export_df.to_excel(w, index=False, sheet_name="汇总")
+        ws = w.book["汇总"]
+        ws.column_dimensions["H"].width = 18
+        if image_refs:
+            try:
+                from openpyxl.drawing.image import Image as XLImage
+            except ImportError:
+                XLImage = None  # type: ignore
+            if XLImage is not None:
+                for excel_row, path in image_refs:
+                    try:
+                        img = XLImage(str(path))
+                    except Exception:
+                        continue
+                    img.width = 96
+                    img.height = 96
+                    ws.row_dimensions[excel_row].height = 78
+                    ws.add_image(img, f"H{excel_row}")
     buf.seek(0)
     return buf.read()
 
@@ -865,6 +979,8 @@ def main() -> None:
         if extra:
             df = df.drop(columns=extra, errors="ignore")
         st.session_state.table_df = df.reindex(columns=COLUMNS, fill_value="")
+    if "draft_df" not in st.session_state:
+        st.session_state.draft_df = pd.DataFrame(columns=COLUMNS)
 
     cfg = load_settings()
     prov = cfg.get("provider", "DeepSeek")
@@ -895,11 +1011,11 @@ def main() -> None:
                 row = apply_note_business_rules(chat, row)
                 if not row.get("时间"):
                     row["时间"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                st.session_state.table_df = merge_row_into_table(
-                    st.session_state.table_df,
-                    row,
+                st.session_state.draft_df = pd.DataFrame(
+                    split_row_into_draft_rows(row, chat),
+                    columns=COLUMNS,
                 )
-                st.success("分析完成，可在下方表格中继续手改。")
+                st.success("分析完成，已放入「待确认汇总框」。")
             except Exception as e:
                 err = str(e)
                 st.error(f"调用失败：{e}")
@@ -931,8 +1047,56 @@ def main() -> None:
         base["时间"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         row = merge_ai_into_row(base, naive)
         row = apply_note_business_rules(chat, row)
-        st.session_state.table_df = merge_row_into_table(st.session_state.table_df, row)
-        st.info("已用本地规则生成草稿；需要 AI 时请在「设置」中配置密钥后点「AI 分析」。")
+        st.session_state.draft_df = pd.DataFrame(
+            split_row_into_draft_rows(row, chat),
+            columns=COLUMNS,
+        )
+        st.info("已用本地规则放入「待确认汇总框」；需要 AI 时请在「设置」中配置密钥后点「AI 分析」。")
+
+    st.subheader("待确认汇总框")
+    st.caption("识别结果先放在这里；多尺寸/数量会先拆成多行。上传图片后可按顺序填入图片列，再一起加入 Excel 汇总表。")
+    draft_df = st.session_state.draft_df.copy()
+    for col in COLUMNS:
+        if col not in draft_df.columns:
+            draft_df[col] = ""
+    draft_df = draft_df.reindex(columns=COLUMNS, fill_value="")
+    uploaded_images = st.file_uploader(
+        "上传本次对话里的图片/截图（可多选，按文件选择顺序对应上方行）",
+        type=["png", "jpg", "jpeg", "webp", "bmp"],
+        accept_multiple_files=True,
+    )
+    draft_actions = st.columns([1.3, 1.2, 1.0, 2.5])
+    with draft_actions[0]:
+        if st.button("图片按顺序填入", disabled=not uploaded_images):
+            paths = save_uploaded_images(uploaded_images)
+            draft_df = assign_images_to_draft(draft_df, paths)
+            st.session_state.draft_df = draft_df
+            st.success(f"已填入 {len(paths)} 张图片。")
+            st.rerun()
+    draft_edited = st.data_editor(
+        draft_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="draft_editor",
+    )
+    st.session_state.draft_df = draft_edited.copy()
+    with draft_actions[1]:
+        if st.button("加入下方汇总表", type="primary", disabled=len(draft_edited) == 0):
+            merged = st.session_state.table_df.copy()
+            added = 0
+            for _, rec in draft_edited.iterrows():
+                row = {col: str(rec.get(col, "") or "") for col in COLUMNS}
+                if not _row_has_content(row):
+                    continue
+                merged = merge_row_into_table(merged, row)
+                added += 1
+            st.session_state.table_df = merged
+            st.success(f"已处理 {added} 行到汇总表。")
+    with draft_actions[2]:
+        if st.button("清空汇总框", disabled=len(draft_edited) == 0):
+            st.session_state.draft_df = pd.DataFrame(columns=COLUMNS)
+            st.rerun()
 
     st.subheader("汇总表（与 Excel 模板列一致）")
     edited = st.data_editor(
