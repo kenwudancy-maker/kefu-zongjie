@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from difflib import SequenceMatcher
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -266,6 +267,7 @@ def extract_amount_from_chat(c: str) -> str:
     if not c:
         return ""
     for pat in (
+        r"订单总价[：:]\s*[¥￥]?\s*(\d+(?:\.\d+)?)",
         r"实收[：:]\s*[¥￥]?\s*(\d+(?:\.\d+)?)",
         r"实付[款]?[：:]\s*[¥￥]?\s*(\d+(?:\.\d+)?)",
         r"合计[：:]\s*[¥￥]?\s*(\d+(?:\.\d+)?)",
@@ -280,10 +282,29 @@ def extract_amount_from_chat(c: str) -> str:
     return ""
 
 
+def extract_order_number_from_chat(c: str) -> str:
+    if not c:
+        return ""
+    for pat in (
+        r"(?:订单号|订单编号|订单|单号)[：:\s#]*([A-Za-z0-9-]{8,32})",
+        r"(?m)^\s*订单\s*[\r\n]+\s*([A-Za-z0-9-]{8,32})\s*$",
+        r"^\s*(\d{16,22})\b",
+    ):
+        m = re.search(pat, c, flags=re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
 def extract_address_from_chat(c: str) -> str:
     if not c:
         return ""
-    m = re.search(r"收货地址[：:\s]*([^\n\r]+)", c)
+    m = re.search(r"收货信息[：:][ \t]*([^\n\r]+)", c)
+    if m:
+        t = re.sub(r"\s+", " ", m.group(1)).strip(" ，,;；")
+        if len(t) >= 4:
+            return t[:240]
+    m = re.search(r"收货地址[：:][ \t]*([^\n\r]+)", c)
     if m:
         t = m.group(1).strip()
         if len(t) >= 4:
@@ -370,9 +391,24 @@ def apply_note_business_rules(chat: str, row: dict[str, str]) -> dict[str, str]:
     """金额/地址启发式补全；工艺列短码；备注仅保留快递等并去掉工艺长句。"""
     out = dict(row)
     c = chat or ""
+    is_platform_order_card = bool(
+        (
+            re.search(r"收货信息[：:]", c)
+            and re.search(r"订单总价[：:]", c)
+            and re.search(r"^\s*\d{16,22}\b", c, flags=re.MULTILINE)
+        )
+        or (
+            re.search(r"(?m)^\s*订单\s*$", c)
+            and re.search(r"价格明细\s*实收[：:]\s*[¥￥]?\s*\d", c)
+        )
+    )
     design = (out.get("设计要求") or "").strip()
     ai_gy = (out.get("工艺") or "").strip()
 
+    if not (out.get("订单号") or "").strip():
+        order_no = extract_order_number_from_chat(c)
+        if order_no:
+            out["订单号"] = order_no
     if not (out.get("金额") or "").strip():
         amt = extract_amount_from_chat(c)
         if amt:
@@ -381,6 +417,14 @@ def apply_note_business_rules(chat: str, row: dict[str, str]) -> dict[str, str]:
         addr = extract_address_from_chat(c)
         if addr:
             out["收货地址"] = addr
+
+    if is_platform_order_card:
+        out["订单号"] = extract_order_number_from_chat(c) or out.get("订单号", "")
+        out["金额"] = extract_amount_from_chat(c) or out.get("金额", "")
+        out["收货地址"] = extract_address_from_chat(c) or out.get("收货地址", "")
+        for col in ("路径", "尺寸数量", "图片", "设计要求", "工艺", "备注"):
+            out[col] = ""
+        return out
 
     out["工艺"] = merge_process_tokens(c, design, ai_gy)
 
@@ -409,6 +453,74 @@ def apply_note_business_rules(chat: str, row: dict[str, str]) -> dict[str, str]:
 
 def empty_row() -> dict[str, str]:
     return {c: "" for c in COLUMNS}
+
+
+def _row_has_content(row: pd.Series | dict) -> bool:
+    for col in COLUMNS:
+        if col == "时间":
+            continue
+        v = row.get(col, "") if isinstance(row, dict) else row.get(col, "")
+        if str(v or "").strip():
+            return True
+    return False
+
+
+def _normalize_id(v: object) -> str:
+    return re.sub(r"\s+", "", str(v or "")).strip().lower()
+
+
+def _row_signature(row: pd.Series | dict) -> str:
+    fields = ("订单号", "收货地址", "尺寸数量", "金额", "图片", "设计要求")
+    parts = []
+    for col in fields:
+        v = row.get(col, "") if isinstance(row, dict) else row.get(col, "")
+        parts.append(str(v or "").strip())
+    return "\n".join(parts)
+
+
+def _row_similarity(a: pd.Series | dict, b: pd.Series | dict) -> float:
+    sig_a = _row_signature(a)
+    sig_b = _row_signature(b)
+    if not sig_a.strip() or not sig_b.strip():
+        return 0.0
+    return SequenceMatcher(None, sig_a, sig_b).ratio()
+
+
+def merge_row_into_table(df: pd.DataFrame, row: dict[str, str]) -> pd.DataFrame:
+    """同订单号覆盖；明显同一条记录覆盖；差异大则新增一行。"""
+    cur = df.copy() if isinstance(df, pd.DataFrame) else default_table_df()
+    for col in COLUMNS:
+        if col not in cur.columns:
+            cur[col] = ""
+    cur = cur.reindex(columns=COLUMNS, fill_value="")
+
+    new_row = {col: str(row.get(col, "") or "") for col in COLUMNS}
+    if len(cur) == 0:
+        return pd.DataFrame([new_row], columns=COLUMNS)
+
+    content_mask = cur.apply(_row_has_content, axis=1)
+    if not bool(content_mask.any()):
+        return pd.DataFrame([new_row], columns=COLUMNS)
+
+    order_no = _normalize_id(new_row.get("订单号"))
+    if order_no:
+        for idx, old in cur.iterrows():
+            if _normalize_id(old.get("订单号")) == order_no:
+                cur.loc[idx, COLUMNS] = [new_row[c] for c in COLUMNS]
+                return cur
+
+    best_idx: int | None = None
+    best_score = 0.0
+    for idx, old in cur.iterrows():
+        score = _row_similarity(old, new_row)
+        if score > best_score:
+            best_idx = int(idx)
+            best_score = score
+    if best_idx is not None and best_score >= 0.88:
+        cur.loc[best_idx, COLUMNS] = [new_row[c] for c in COLUMNS]
+        return cur
+
+    return pd.concat([cur, pd.DataFrame([new_row], columns=COLUMNS)], ignore_index=True)
 
 
 def merge_ai_into_row(base: dict[str, str], data: dict) -> dict[str, str]:
@@ -783,7 +895,10 @@ def main() -> None:
                 row = apply_note_business_rules(chat, row)
                 if not row.get("时间"):
                     row["时间"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                st.session_state.table_df = pd.DataFrame([row], columns=COLUMNS)
+                st.session_state.table_df = merge_row_into_table(
+                    st.session_state.table_df,
+                    row,
+                )
                 st.success("分析完成，可在下方表格中继续手改。")
             except Exception as e:
                 err = str(e)
@@ -816,7 +931,7 @@ def main() -> None:
         base["时间"] = datetime.now().strftime("%Y-%m-%d %H:%M")
         row = merge_ai_into_row(base, naive)
         row = apply_note_business_rules(chat, row)
-        st.session_state.table_df = pd.DataFrame([row], columns=COLUMNS)
+        st.session_state.table_df = merge_row_into_table(st.session_state.table_df, row)
         st.info("已用本地规则生成草稿；需要 AI 时请在「设置」中配置密钥后点「AI 分析」。")
 
     st.subheader("汇总表（与 Excel 模板列一致）")
